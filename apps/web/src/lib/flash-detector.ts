@@ -2,6 +2,16 @@ export type FlashDetectorOptions = {
   onFlash: () => void;
   thresholdMultiplier?: number;
   cooldownMs?: number;
+  onMetrics?: (metrics: FlashMetrics) => void;
+};
+
+export type FlashMetrics = {
+  luminance: number;
+  peak: number;
+  baseline: number;
+  ratio: number;
+  armed: boolean;
+  spikes: number;
 };
 
 export class FlashDetector {
@@ -12,17 +22,23 @@ export class FlashDetector {
   private rafId = 0;
   private running = false;
   private baseline = 0;
-  private samples: number[] = [];
+  private calibrating = true;
+  private calibrationFrames = 0;
   private lastFlashAt = 0;
   private armed = true;
+  private spikeCount = 0;
+  private spikeWindowStart = 0;
+  private prevPeak = 0;
   private readonly onFlash: () => void;
-  private readonly thresholdMultiplier: number;
+  private readonly onMetrics?: (metrics: FlashMetrics) => void;
+  private thresholdMultiplier: number;
   private readonly cooldownMs: number;
 
   constructor(options: FlashDetectorOptions) {
     this.onFlash = options.onFlash;
-    this.thresholdMultiplier = options.thresholdMultiplier ?? 2.2;
-    this.cooldownMs = options.cooldownMs ?? 1800;
+    this.onMetrics = options.onMetrics;
+    this.thresholdMultiplier = options.thresholdMultiplier ?? 1.45;
+    this.cooldownMs = options.cooldownMs ?? 1000;
     this.video = document.createElement("video");
     this.video.playsInline = true;
     this.video.muted = true;
@@ -38,24 +54,35 @@ export class FlashDetector {
     return this.video;
   }
 
+  setThreshold(multiplier: number): void {
+    this.thresholdMultiplier = multiplier;
+  }
+
   async start(): Promise<void> {
     if (this.running) {
       return;
     }
     this.stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+      video: {
+        facingMode: "user",
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 },
+      },
       audio: false,
     });
     this.video.srcObject = this.stream;
     await this.video.play();
     this.running = true;
-    this.baseline = 0;
-    this.samples = [];
+    this.resetCalibration();
     this.loop();
   }
 
   rearm(): void {
     this.armed = true;
+    this.spikeCount = 0;
+    this.spikeWindowStart = 0;
+    this.resetCalibration();
   }
 
   async stop(): Promise<void> {
@@ -64,6 +91,13 @@ export class FlashDetector {
     this.stream?.getTracks().forEach((track) => track.stop());
     this.stream = null;
     this.video.srcObject = null;
+  }
+
+  private resetCalibration(): void {
+    this.baseline = 0;
+    this.calibrating = true;
+    this.calibrationFrames = 0;
+    this.prevPeak = 0;
   }
 
   private loop = (): void => {
@@ -84,64 +118,104 @@ export class FlashDetector {
     this.canvas.height = videoHeight;
     this.ctx.drawImage(this.video, 0, 0);
     const { data, width, height } = this.ctx.getImageData(0, 0, videoWidth, videoHeight);
-    const luminance = averageLuminance(data, width, height);
+    const { average, peak, brightRatio } = measureFrame(data, width, height);
+    const luminance = average;
 
-    this.samples.push(luminance);
-    if (this.samples.length > 30) {
-      this.samples.shift();
+    if (this.calibrating) {
+      this.calibrationFrames++;
+      if (this.baseline === 0) {
+        this.baseline = luminance;
+      } else {
+        this.baseline = this.baseline * 0.85 + luminance * 0.15;
+      }
+      if (this.calibrationFrames >= 20) {
+        this.calibrating = false;
+      }
+      this.emitMetrics(luminance, peak);
+      return;
     }
 
-    if (this.baseline === 0 && this.samples.length >= 15) {
-      this.baseline = median(this.samples) || luminance;
+    if (this.baseline > 0 && luminance < this.baseline * 1.12) {
+      this.baseline = this.baseline * 0.97 + luminance * 0.03;
     }
 
-    if (this.baseline > 0 && this.armed) {
-      const ratio = luminance / this.baseline;
+    const peakRatio = peak / Math.max(this.baseline, 1);
+    const avgRatio = luminance / Math.max(this.baseline, 1);
+    const peakDelta = peak - this.prevPeak;
+    this.prevPeak = peak * 0.3 + this.prevPeak * 0.7;
+
+    const ratio = Math.max(peakRatio, avgRatio);
+    const isSpike =
+      this.armed &&
+      (peakRatio >= this.thresholdMultiplier ||
+        (peakRatio >= this.thresholdMultiplier * 0.85 && brightRatio >= 0.008) ||
+        (peakDelta >= 35 && peakRatio >= 1.25));
+
+    if (isSpike) {
       const now = Date.now();
-      if (ratio >= this.thresholdMultiplier && now - this.lastFlashAt > this.cooldownMs) {
+      if (this.spikeWindowStart === 0 || now - this.spikeWindowStart > 2500) {
+        this.spikeWindowStart = now;
+        this.spikeCount = 0;
+      }
+      this.spikeCount++;
+
+      if (this.spikeCount >= 2 && now - this.lastFlashAt > this.cooldownMs) {
         this.lastFlashAt = now;
         this.armed = false;
+        this.spikeCount = 0;
+        this.spikeWindowStart = 0;
         this.onFlash();
-        setTimeout(() => {
-          this.baseline = median(this.samples) || this.baseline;
-        }, 400);
+        setTimeout(() => this.resetCalibration(), 300);
       }
     }
 
-    if (this.baseline > 0) {
-      const alpha = 0.08;
-      this.baseline = this.baseline * (1 - alpha) + luminance * alpha;
+    this.emitMetrics(luminance, peak);
+  }
+
+  private emitMetrics(luminance: number, peak: number): void {
+    if (!this.onMetrics) {
+      return;
     }
+    this.onMetrics({
+      luminance,
+      peak,
+      baseline: this.baseline,
+      ratio: peak / Math.max(this.baseline, 1),
+      armed: this.armed,
+      spikes: this.spikeCount,
+    });
   }
 }
 
-function averageLuminance(data: Uint8ClampedArray, width: number, height: number): number {
-  const cx = Math.floor(width / 2);
-  const cy = Math.floor(height / 2);
-  const boxW = Math.floor(width * 0.5);
-  const boxH = Math.floor(height * 0.5);
-  const x0 = Math.max(0, cx - boxW / 2);
-  const y0 = Math.max(0, cy - boxH / 2);
-  const x1 = Math.min(width, x0 + boxW);
-  const y1 = Math.min(height, y0 + boxH);
-
+function measureFrame(
+  data: Uint8ClampedArray,
+  width: number,
+  height: number,
+): { average: number; peak: number; brightRatio: number } {
   let sum = 0;
   let count = 0;
-  for (let y = y0; y < y1; y += 2) {
-    for (let x = x0; x < x1; x += 2) {
+  let peak = 0;
+  let brightCount = 0;
+  const brightThreshold = 200;
+
+  for (let y = 0; y < height; y += 3) {
+    for (let x = 0; x < width; x += 3) {
       const i = (y * width + x) * 4;
-      sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      sum += lum;
       count++;
+      if (lum > peak) {
+        peak = lum;
+      }
+      if (lum >= brightThreshold) {
+        brightCount++;
+      }
     }
   }
-  return count ? sum / count : 0;
-}
 
-function median(values: number[]): number {
-  if (!values.length) {
-    return 0;
-  }
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  return {
+    average: count ? sum / count : 0,
+    peak,
+    brightRatio: count ? brightCount / count : 0,
+  };
 }

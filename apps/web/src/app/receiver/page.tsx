@@ -6,6 +6,7 @@ import { TransferDecoder } from "@blacking/protocol";
 import type { TransferFile } from "@blacking/protocol";
 import { QrScanner } from "@/lib/qr-scanner";
 import { TorchController } from "@/lib/torch-controller";
+import { ScreenAckFlasher } from "@/lib/screen-ack-flasher";
 import { downloadAsZip, downloadFile, formatBytes } from "@/lib/file-utils";
 
 type Phase = "idle" | "scanning" | "done";
@@ -16,11 +17,12 @@ export default function ReceiverPage() {
   const [lastIndex, setLastIndex] = useState(-1);
   const [assembledFiles, setAssembledFiles] = useState<TransferFile[]>([]);
   const [status, setStatus] = useState("לחץ להתחלת סריקה");
-  const [torchSupported, setTorchSupported] = useState(true);
+  const [torchSupported, setTorchSupported] = useState<boolean | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const decoderRef = useRef(new TransferDecoder());
   const torchRef = useRef(new TorchController());
+  const screenAckRef = useRef(new ScreenAckFlasher());
   const processingRef = useRef(false);
   const lastAckAtRef = useRef(0);
 
@@ -47,13 +49,11 @@ export default function ReceiverPage() {
     setStatus(`נקלט QR ${prog.received}/${prog.total}`);
 
     const now = Date.now();
-    if (now - lastAckAtRef.current > 1200) {
+    if (now - lastAckAtRef.current > 900) {
       lastAckAtRef.current = now;
-      try {
-        await torchRef.current.blinkAck();
-      } catch {
-        setTorchSupported(false);
-      }
+      const torchOk = await torchRef.current.blinkAck();
+      await screenAckRef.current.blinkAck();
+      setTorchSupported(torchOk);
     }
 
     if (result.complete) {
@@ -88,6 +88,9 @@ export default function ReceiverPage() {
       const stream = scanner.getStream();
       if (stream) {
         torchRef.current.bind(stream);
+        const probe = await torchRef.current.setEnabled(true);
+        await torchRef.current.off();
+        setTorchSupported(probe);
       }
       setStatus("סרוק את ה-QR מהמסך");
     } catch {
@@ -157,10 +160,13 @@ export default function ReceiverPage() {
                 </p>
               </>
             )}
-            {!torchSupported && (
+            {torchSupported === false && (
               <p className="mt-2 text-center text-xs text-amber-400">
-                הפנס לא נתמך בדפדפן זה — המחשב לא יזהה אישור אוטומטי
+                פנס לא זמין — נשלח הבהוב מסך לבן כאות למחשב
               </p>
+            )}
+            {torchSupported === true && (
+              <p className="mt-2 text-center text-xs text-emerald-400">פנס פעיל — אות אופטי נשלח למחשב</p>
             )}
           </div>
 

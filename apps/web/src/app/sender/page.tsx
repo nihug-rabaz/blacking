@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TransferEncoder } from "@blacking/protocol";
-import { FlashDetector } from "@/lib/flash-detector";
+import { FlashDetector, type FlashMetrics } from "@/lib/flash-detector";
 import { readFilesFromInput, formatBytes } from "@/lib/file-utils";
 import { generateQrDataUrl } from "@/lib/qr-generator";
 
@@ -18,6 +18,8 @@ export default function SenderPage() {
   const [fileInfo, setFileInfo] = useState("");
   const [flashReady, setFlashReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
+  const [flashMetrics, setFlashMetrics] = useState<FlashMetrics | null>(null);
+  const [sensitivity, setSensitivity] = useState(1.45);
   const videoRef = useRef<HTMLVideoElement>(null);
   const detectorRef = useRef<FlashDetector | null>(null);
   const advancingRef = useRef(false);
@@ -95,7 +97,11 @@ export default function SenderPage() {
     let detector: FlashDetector;
     const setup = async () => {
       try {
-        detector = new FlashDetector({ onFlash: advanceQr });
+        detector = new FlashDetector({
+          onFlash: advanceQr,
+          thresholdMultiplier: sensitivity,
+          onMetrics: setFlashMetrics,
+        });
         detectorRef.current = detector;
         await detector.start();
         const video = detector.getVideoElement();
@@ -118,6 +124,10 @@ export default function SenderPage() {
       detectorRef.current = null;
     };
   }, [phase, advanceQr]);
+
+  useEffect(() => {
+    detectorRef.current?.setThreshold(sensitivity);
+  }, [sensitivity]);
 
   const progress = payloads.length ? Math.round((currentIndex / payloads.length) * 100) : 0;
 
@@ -200,8 +210,8 @@ export default function SenderPage() {
               <h3 className="font-semibold">הוראות</h3>
               <ol className="mt-3 list-decimal space-y-2 pr-5 text-sm text-slate-300">
                 <li>פתח את דף המקבל בטלפון</li>
-                <li>הנח את הטלפון מול המסך — מצלמה לכיוון ה-QR</li>
-                <li>כוון את מצלמת המחשב לעבר הפנס של הטלפון</li>
+                <li>הנח את <strong>גב הטלפון</strong> לכיוון מצלמת המחשב (הפנס ליד המצלמה האחורית)</li>
+                <li>מצלמת הטלפון פונה ל-QR על המסך</li>
                 <li>כשהטלפון סורק — הפנס יהבהב והמחשב יעבור ל-QR הבא</li>
               </ol>
             </div>
@@ -214,9 +224,42 @@ export default function SenderPage() {
                 muted
                 className="mt-2 aspect-video w-full rounded-xl bg-black object-cover"
               />
+              {flashMetrics && (
+                <div className="mt-3 space-y-2">
+                  <div className="flex justify-between text-xs text-slate-400">
+                    <span>בהירות שיא</span>
+                    <span>{flashMetrics.ratio.toFixed(2)}x מהרקע</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-surface-border">
+                    <div
+                      className={`h-full transition-all ${flashMetrics.ratio >= sensitivity ? "bg-emerald-400" : "bg-accent"}`}
+                      style={{ width: `${Math.min(100, (flashMetrics.ratio / 3) * 100)}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    {flashMetrics.armed
+                      ? flashMetrics.spikes > 0
+                        ? `זוהתה הבהוב (${flashMetrics.spikes})...`
+                        : "ממתין להבהוב — ודא שגב הטלפון פונה למצלמה"
+                      : "אושר — עובר ל-QR הבא"}
+                  </p>
+                </div>
+              )}
+              <label className="mt-3 block text-xs text-slate-400">
+                רגישות זיהוי: {sensitivity.toFixed(2)}
+                <input
+                  type="range"
+                  min="1.15"
+                  max="2.5"
+                  step="0.05"
+                  value={sensitivity}
+                  onChange={(e) => setSensitivity(Number(e.target.value))}
+                  className="mt-1 w-full accent-accent"
+                />
+              </label>
               <p className="mt-2 text-xs text-slate-400">
                 {flashReady
-                  ? "מצלמה פעילה — ממתין להבהוב פנס מהטלפון"
+                  ? "מצלמה פעילה — כוון לפנס בגב הטלפון"
                   : cameraError || "מאתחל מצלמה..."}
               </p>
             </div>

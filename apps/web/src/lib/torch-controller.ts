@@ -4,34 +4,57 @@ type TorchCapableTrack = MediaStreamTrack & {
 
 export class TorchController {
   private track: TorchCapableTrack | null = null;
+  private supported = false;
 
   bind(stream: MediaStream): void {
     this.track = stream.getVideoTracks()[0] as TorchCapableTrack;
+    this.supported = false;
   }
 
-  async setEnabled(enabled: boolean): Promise<void> {
+  isSupported(): boolean {
+    return this.supported;
+  }
+
+  async setEnabled(enabled: boolean): Promise<boolean> {
     if (!this.track) {
-      return;
+      return false;
     }
     try {
       await this.track.applyConstraints({
         advanced: [{ torch: enabled } as MediaTrackConstraintSet],
       });
+      if (enabled) {
+        this.supported = true;
+      }
+      return true;
     } catch {
       try {
         await this.track.applyConstraints({ torch: enabled } as MediaTrackConstraints);
+        if (enabled) {
+          this.supported = true;
+        }
+        return true;
       } catch {
-        /* torch unsupported */
+        return false;
       }
     }
   }
 
-  async blinkAck(): Promise<void> {
-    const pattern = [true, false, true, false, true, false] as const;
+  async blinkAck(): Promise<boolean> {
+    const pattern = [true, false, true, false, true, false, true, false] as const;
+    let anySuccess = false;
     for (const state of pattern) {
-      await this.setEnabled(state);
-      await sleep(state ? 120 : 100);
+      const ok = await this.setEnabled(state);
+      if (ok && state) {
+        anySuccess = true;
+      }
+      await sleep(state ? 280 : 180);
     }
+    return anySuccess;
+  }
+
+  async testBlink(): Promise<boolean> {
+    return this.blinkAck();
   }
 
   async off(): Promise<void> {
