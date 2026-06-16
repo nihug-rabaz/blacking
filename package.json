@@ -1,0 +1,13 @@
+{
+  "name": "blacking",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=@blacking/web",
+    "build": "npm run build --workspace=@blacking/web",
+    "start": "npm run start --workspace=@blacking/web"
+  }
+}
