@@ -6,7 +6,7 @@ export default function HomePage() {
       <div className="text-center">
         <h1 className="text-4xl font-bold tracking-tight">Blacking</h1>
         <p className="mt-3 max-w-md text-slate-400">
-          העברת קבצים וטקסט בין מחשב לטלפון דרך QR — ללא רשת, רק אור
+          העברת קבצים וטקסט בין מחשב לטלפון דרך QR — ללא רשת, פנס או סאונד
         </p>
       </div>
 
@@ -18,7 +18,7 @@ export default function HomePage() {
           <div className="text-3xl">🖥️</div>
           <h2 className="mt-3 text-xl font-semibold">מחשב (שולח)</h2>
           <p className="mt-2 text-sm text-slate-400">
-            העלה קבצים או טקסט, הצג QR codes, וזהה הבהוב פנס מהטלפון
+            העלה קבצים או טקסט, הצג QR codes, וזהה פנס או סאונד מהטלפון
           </p>
         </Link>
 
@@ -29,7 +29,7 @@ export default function HomePage() {
           <div className="text-3xl">📱</div>
           <h2 className="mt-3 text-xl font-semibold">טלפון (מקבל)</h2>
           <p className="mt-2 text-sm text-slate-400">
-            סרוק QR codes מהמסך, הפנס יהבהב לאישור אופטי
+            סרוק QR codes מהמסך — אישור בפנס או ב-2 תדרים ייחודיים
           </p>
         </Link>
       </div>

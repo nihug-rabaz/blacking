@@ -8,9 +8,13 @@ import {
   getTransferSpeedProfile,
   ChunkBytesConfig,
   DEFAULT_CHUNK_BYTES,
+  AckAudioSignal,
   type TransferSpeed,
+  type AckChannel,
 } from "@blacking/protocol";
 import { FlashDetector, type FlashMetrics } from "@/lib/flash-detector";
+import { ToneDetector, type ToneMetrics } from "@/lib/tone-detector";
+import { getStoredAckChannel, storeAckChannel } from "@/lib/ack-channel";
 import { readFilesFromInput, formatBytes } from "@/lib/file-utils";
 import { generateQrDataUrl, QR_DISPLAY_SIZE } from "@/lib/qr-generator";
 import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
@@ -27,18 +31,28 @@ export default function SenderPage() {
   const [flashReady, setFlashReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [flashMetrics, setFlashMetrics] = useState<FlashMetrics | null>(null);
+  const [toneMetrics, setToneMetrics] = useState<ToneMetrics | null>(null);
   const [minJump, setMinJump] = useState(18);
+  const [ackChannel, setAckChannel] = useState<AckChannel>("optical");
+  const [ackReady, setAckReady] = useState(false);
+  const [ackError, setAckError] = useState("");
   const [chunkBytes, setChunkBytes] = useState(DEFAULT_CHUNK_BYTES);
   const activePreset = TRANSFER_SPEED_PROFILES.find((profile) => profile.chunkBytes === chunkBytes)?.id;
   const chunkHint = ChunkBytesConfig.hint(chunkBytes);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const detectorRef = useRef<FlashDetector | null>(null);
+  const flashDetectorRef = useRef<FlashDetector | null>(null);
+  const toneDetectorRef = useRef<ToneDetector | null>(null);
   const resetSession = useCallback(() => {
-    detectorRef.current?.stop();
-    detectorRef.current = null;
+    void flashDetectorRef.current?.stop();
+    void toneDetectorRef.current?.stop();
+    flashDetectorRef.current = null;
+    toneDetectorRef.current = null;
     setFlashMetrics(null);
+    setToneMetrics(null);
     setFlashReady(false);
+    setAckReady(false);
     setCameraError("");
+    setAckError("");
     setQrUrl("");
     setCurrentIndex(0);
     setPayloads([]);
@@ -57,7 +71,9 @@ export default function SenderPage() {
 
   const startTransfer = useCallback(async (files: { path: string; content: Uint8Array }[]) => {
     setFlashMetrics(null);
+    setToneMetrics(null);
     setFlashReady(false);
+    setAckReady(false);
     const encoder = new TransferEncoder();
     const encoded = encoder.encode(files, { chunkBytes });
     setPayloads(encoded.payloads);
@@ -71,7 +87,9 @@ export default function SenderPage() {
       return;
     }
     setFlashMetrics(null);
+    setToneMetrics(null);
     setFlashReady(false);
+    setAckReady(false);
     const encoder = new TransferEncoder();
     const encoded = encoder.encodeText(text, "content.txt", { chunkBytes });
     setPayloads(encoded.payloads);
@@ -100,16 +118,28 @@ export default function SenderPage() {
       const next = prev + 1;
       if (next >= payloads.length) {
         setPhase("done");
-        detectorRef.current?.stop();
+        void flashDetectorRef.current?.stop();
+        void toneDetectorRef.current?.stop();
+      } else if (ackChannel === "audio") {
+        toneDetectorRef.current?.rearm();
       } else {
-        detectorRef.current?.rearm();
+        flashDetectorRef.current?.rearm();
       }
       return next;
     });
     setTimeout(() => {
       advancingRef.current = false;
     }, 200);
-  }, [payloads.length]);
+  }, [payloads.length, ackChannel]);
+
+  useEffect(() => {
+    setAckChannel(getStoredAckChannel());
+  }, []);
+
+  const selectAckChannel = (channel: AckChannel) => {
+    setAckChannel(channel);
+    storeAckChannel(channel);
+  };
 
   useEffect(() => {
     if (phase !== "transfer" || !payloads.length) {
@@ -129,7 +159,8 @@ export default function SenderPage() {
       prevQrIndexRef.current = -1;
       return;
     }
-    const detector = detectorRef.current;
+    const detector =
+      ackChannel === "audio" ? toneDetectorRef.current : flashDetectorRef.current;
     if (!detector) {
       return;
     }
@@ -139,24 +170,38 @@ export default function SenderPage() {
       }
       prevQrIndexRef.current = currentIndex;
     }
-  }, [currentIndex, phase]);
+  }, [currentIndex, phase, ackChannel]);
 
   useEffect(() => {
     if (phase !== "transfer") {
       return;
     }
 
-    let detector: FlashDetector;
+    let flashDetector: FlashDetector | undefined;
+    let toneDetector: ToneDetector | undefined;
+
     const setup = async () => {
       try {
-        detector = new FlashDetector({
+        if (ackChannel === "audio") {
+          toneDetector = new ToneDetector({
+            onAck: advanceQr,
+            onMetrics: setToneMetrics,
+          });
+          toneDetectorRef.current = toneDetector;
+          await toneDetector.start();
+          setAckReady(true);
+          setAckError("");
+          return;
+        }
+
+        flashDetector = new FlashDetector({
           onFlash: advanceQr,
           minJump,
           onMetrics: setFlashMetrics,
         });
-        detectorRef.current = detector;
-        await detector.start();
-        const video = detector.getVideoElement();
+        flashDetectorRef.current = flashDetector;
+        await flashDetector.start();
+        const video = flashDetector.getVideoElement();
         if (videoRef.current) {
           videoRef.current.srcObject = video.srcObject;
           await videoRef.current.play();
@@ -164,6 +209,11 @@ export default function SenderPage() {
         setFlashReady(true);
         setCameraError("");
       } catch {
+        if (ackChannel === "audio") {
+          setAckError("לא ניתן לגשת למיקרופון — אשר הרשאות כדי לזהות סאונד");
+          setAckReady(false);
+          return;
+        }
         setCameraError("לא ניתן לגשת למצלמה — אשר גישה כדי לזהות הבהוב פנס");
         setFlashReady(false);
       }
@@ -172,16 +222,22 @@ export default function SenderPage() {
     setup();
 
     return () => {
-      detector?.stop();
-      detectorRef.current = null;
+      void flashDetector?.stop();
+      void toneDetector?.stop();
+      flashDetectorRef.current = null;
+      toneDetectorRef.current = null;
     };
-  }, [phase, advanceQr]);
+  }, [phase, advanceQr, ackChannel]);
 
   useEffect(() => {
-    detectorRef.current?.setMinJump(minJump);
+    flashDetectorRef.current?.setMinJump(minJump);
   }, [minJump]);
 
   const progress = payloads.length ? Math.round((currentIndex / payloads.length) * 100) : 0;
+  const isCalibrating =
+    ackChannel === "audio"
+      ? toneMetrics?.phase === "calibrating"
+      : flashMetrics?.phase === "calibrating";
 
   return (
     <main className="min-h-screen p-4 md:p-8">
@@ -247,6 +303,39 @@ export default function SenderPage() {
           </section>
 
           <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
+            <h2 className="text-lg font-semibold">אות אישור מהטלפון</h2>
+            <p className="mt-2 text-sm text-slate-400">
+              {ackChannel === "audio"
+                ? `זיהוי 2 תדרים ייחודיים: ${AckAudioSignal.tonesHz[0]}Hz + ${AckAudioSignal.tonesHz[1]}Hz`
+                : "זיהוי הבהוב פנס דרך מצלמת המחשב"}
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => selectAckChannel("optical")}
+                className={`rounded-xl border px-4 py-3 text-sm transition ${
+                  ackChannel === "optical"
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-surface-border hover:border-accent/50"
+                }`}
+              >
+                🔦 פנס
+              </button>
+              <button
+                type="button"
+                onClick={() => selectAckChannel("audio")}
+                className={`rounded-xl border px-4 py-3 text-sm transition ${
+                  ackChannel === "audio"
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-surface-border hover:border-accent/50"
+                }`}
+              >
+                🔊 סאונד
+              </button>
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
             <h2 className="text-lg font-semibold">העברת טקסט</h2>
             <textarea
               value={text}
@@ -291,7 +380,7 @@ export default function SenderPage() {
         <div className="mx-auto flex max-w-7xl flex-col items-center gap-8 xl:flex-row xl:items-start xl:justify-center">
           <div className="flex w-full max-w-[840px] flex-col items-center">
             <div className="w-full rounded-2xl bg-white p-3 shadow-2xl shadow-accent/10 sm:p-5">
-              {flashMetrics?.phase !== "calibrating" && qrUrl ? (
+              {!isCalibrating && qrUrl ? (
                 <img
                   src={qrUrl}
                   alt="QR Code"
@@ -304,8 +393,10 @@ export default function SenderPage() {
                   className="flex w-full flex-col items-center justify-center gap-2 text-slate-500"
                   style={{ aspectRatio: "1 / 1", minHeight: QR_DISPLAY_SIZE }}
                 >
-                  <span className="text-4xl">📷</span>
-                  <span className="text-base">מכייל מצלמה...</span>
+                  <span className="text-4xl">{ackChannel === "audio" ? "🔊" : "📷"}</span>
+                  <span className="text-base">
+                    {ackChannel === "audio" ? "מכייל מיקרופון..." : "מכייל מצלמה..."}
+                  </span>
                 </div>
               )}
             </div>
@@ -322,22 +413,71 @@ export default function SenderPage() {
             <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
               <h3 className="font-semibold">הוראות</h3>
               <ol className="mt-3 list-decimal space-y-2 pr-5 text-sm text-slate-300">
-                <li>פתח את דף המקבל בטלפון</li>
-                <li>הנח את <strong>גב הטלפון</strong> לכיוון מצלמת המחשב (הפנס ליד המצלמה האחורית)</li>
-                <li>מצלמת הטלפון פונה ל-QR על המסך</li>
-                <li>כשהטלפון סורק — הפנס יהבהב והמחשב יעבור ל-QR הבא</li>
+                <li>פתח את דף המקבל בטלפון — אותו מצב ({ackChannel === "audio" ? "סאונד" : "פנס"})</li>
+                {ackChannel === "audio" ? (
+                  <>
+                    <li>הנח את רמקול הטלפון לכיוון מיקרופון המחשב</li>
+                    <li>מצלמת הטלפון פונה ל-QR על המסך</li>
+                    <li>כשהטלפון סורק — יישמעו 2 תדרים קצרים והמחשב יעבור ל-QR הבא</li>
+                  </>
+                ) : (
+                  <>
+                    <li>הנח את <strong>גב הטלפון</strong> לכיוון מצלמת המחשב (הפנס)</li>
+                    <li>מצלמת הטלפון פונה ל-QR על המסך</li>
+                    <li>כשהטלפון סורק — הפנס יהבהב והמחשב יעבור ל-QR הבא</li>
+                  </>
+                )}
               </ol>
             </div>
 
             <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
-              <h3 className="font-semibold">זיהוי פנס</h3>
-              <video
-                ref={videoRef}
-                playsInline
-                muted
-                className="mt-2 aspect-video w-full rounded-xl bg-black object-cover"
-              />
-              {flashMetrics && (
+              <h3 className="font-semibold">{ackChannel === "audio" ? "זיהוי סאונד" : "זיהוי פנס"}</h3>
+              {ackChannel === "optical" && (
+                <video
+                  ref={videoRef}
+                  playsInline
+                  muted
+                  className="mt-2 aspect-video w-full rounded-xl bg-black object-cover"
+                />
+              )}
+              {ackChannel === "audio" && toneMetrics && (
+                <div className="mt-3 space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">
+                      {toneMetrics.phase === "calibrating"
+                        ? `מכייל רעש רקע... ${Math.round(toneMetrics.calibrationProgress * 100)}%`
+                        : toneMetrics.graceRemainingMs > 0
+                          ? "מוכן בעוד רגע..."
+                          : `ממתין ל-${toneMetrics.requiredTones} תדרים`}
+                    </span>
+                    <span className={toneMetrics.toneCount > 0 ? "text-emerald-400" : "text-slate-500"}>
+                      {toneMetrics.ready
+                        ? `${toneMetrics.toneCount}/${toneMetrics.requiredTones} תדרים`
+                        : "—"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-xs text-slate-500">
+                    <span>יעד: {toneMetrics.targetHz.toFixed(1)}Hz</span>
+                    <span>SNR: {toneMetrics.snr.toFixed(1)}</span>
+                  </div>
+                  <div className="h-2 overflow-hidden rounded-full bg-surface-border">
+                    <div
+                      className="h-full bg-accent transition-all"
+                      style={{
+                        width: `${(toneMetrics.toneCount / toneMetrics.requiredTones) * 100}%`,
+                      }}
+                    />
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    {toneMetrics.phase === "calibrating"
+                      ? "מכייל מיקרופון — אל תשמיע סאונד"
+                      : toneMetrics.armed
+                        ? "מוכן — 2 תדרים ייחודיים = סריקה אושרה"
+                        : "סריקה זוהתה — עובר ל-QR הבא"}
+                  </p>
+                </div>
+              )}
+              {ackChannel === "optical" && flashMetrics && (
                 <div className="mt-3 space-y-2">
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-slate-400">
@@ -403,6 +543,7 @@ export default function SenderPage() {
                   </p>
                 </div>
               )}
+              {ackChannel === "optical" && (
               <label className="mt-3 block text-xs text-slate-400">
                 סף קפיצה מינימלי: {minJump}
                 <input
@@ -415,10 +556,15 @@ export default function SenderPage() {
                   className="mt-1 w-full accent-accent"
                 />
               </label>
+              )}
               <p className="mt-2 text-xs text-slate-400">
-                {flashReady
-                  ? "מצלמה פעילה — כוון לפנס בגב הטלפון"
-                  : cameraError || "מאתחל מצלמה..."}
+                {ackChannel === "audio"
+                  ? ackReady
+                    ? "מיקרופון פעיל — כוון רמקול טלפון למחשב"
+                    : ackError || "מאתחל מיקרופון..."
+                  : flashReady
+                    ? "מצלמה פעילה — כוון לפנס בגב הטלפון"
+                    : cameraError || "מאתחל מצלמה..."}
               </p>
             </div>
 

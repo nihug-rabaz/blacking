@@ -5,7 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { TransferDecoder } from "@blacking/protocol";
 import type { TransferFile } from "@blacking/protocol";
 import { QrScanner } from "@/lib/qr-scanner";
-import { OpticalAckSender } from "@/lib/optical-ack-sender";
+import { ScanAckSender } from "@/lib/scan-ack-sender";
+import { getStoredAckChannel, storeAckChannel } from "@/lib/ack-channel";
+import type { AckChannel } from "@blacking/protocol";
 import { downloadAsZip, downloadFile, formatBytes } from "@/lib/file-utils";
 import { getCameraBlockedReason, getLocalNetworkHint } from "@/lib/camera-access";
 
@@ -20,17 +22,19 @@ export default function ReceiverPage() {
   const [torchSupported, setTorchSupported] = useState<boolean | null>(null);
   const [cameraBlocked, setCameraBlocked] = useState<string | null>(null);
   const [networkHint, setNetworkHint] = useState("");
+  const [ackChannel, setAckChannel] = useState<AckChannel>("optical");
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const decoderRef = useRef(new TransferDecoder());
-  const ackRef = useRef(new OpticalAckSender());
+  const ackRef = useRef(new ScanAckSender());
   const processingRef = useRef(false);
   const lastScanAtRef = useRef(Date.now());
 
   const sendAck = useCallback(async (scanner: QrScanner | null) => {
+    ackRef.current.setMode(ackChannel);
     await ackRef.current.send(scanner);
     setTorchSupported(ackRef.current.isTorchSupported());
-  }, []);
+  }, [ackChannel]);
 
   const handleScan = useCallback(
     async (raw: string) => {
@@ -52,7 +56,11 @@ export default function ReceiverPage() {
         const prog = decoder.getProgress();
         setProgress(prog);
         setLastIndex(prog.received - 1);
-        setStatus(`נקלט QR ${prog.received}/${prog.total} — שולח אות פנס...`);
+        setStatus(
+          ackChannel === "audio"
+            ? `נקלט QR ${prog.received}/${prog.total} — משמיע אות...`
+            : `נקלט QR ${prog.received}/${prog.total} — שולח אות פנס...`,
+        );
         scannerRef.current?.notifyAccepted(prog.received - 1);
 
         await sendAck(scannerRef.current);
@@ -83,6 +91,7 @@ export default function ReceiverPage() {
 
     decoderRef.current.reset();
     ackRef.current.reset();
+    ackRef.current.setMode(ackChannel);
     setProgress({ received: 0, total: 0, filesComplete: 0, fileCount: 0 });
     setLastIndex(-1);
     setAssembledFiles([]);
@@ -113,7 +122,13 @@ export default function ReceiverPage() {
   useEffect(() => {
     setCameraBlocked(getCameraBlockedReason());
     setNetworkHint(getLocalNetworkHint(window.location.port ? Number(window.location.port) : 3000));
+    setAckChannel(getStoredAckChannel());
   }, []);
+
+  const selectAckChannel = (channel: AckChannel) => {
+    setAckChannel(channel);
+    storeAckChannel(channel);
+  };
 
   const stopScanning = () => {
     scannerRef.current?.stop();
@@ -213,15 +228,53 @@ export default function ReceiverPage() {
                 </p>
               </>
             )}
-            {torchSupported === false && (
+            {ackChannel === "optical" && torchSupported === false && (
               <p className="mt-2 text-center text-xs text-amber-400">
                 פנס לא זמין — נשלח הבהוב מסך לבן כאות למחשב
               </p>
             )}
-            {torchSupported === true && (
+            {ackChannel === "optical" && torchSupported === true && (
               <p className="mt-2 text-center text-xs text-emerald-400">פנס פעיל — אות אופטי נשלח למחשב</p>
             )}
+            {ackChannel === "audio" && phase === "scanning" && (
+              <p className="mt-2 text-center text-xs text-emerald-400">מצב סאונד — ודא שהמחשב מאזין למיקרופון</p>
+            )}
           </div>
+
+          {phase === "idle" && (
+            <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
+              <p className="font-medium text-slate-200">אות אישור למחשב</p>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => selectAckChannel("optical")}
+                  className={`rounded-xl border px-3 py-3 text-sm transition ${
+                    ackChannel === "optical"
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-surface-border hover:border-accent/50"
+                  }`}
+                >
+                  🔦 פנס
+                </button>
+                <button
+                  type="button"
+                  onClick={() => selectAckChannel("audio")}
+                  className={`rounded-xl border px-3 py-3 text-sm transition ${
+                    ackChannel === "audio"
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-surface-border hover:border-accent/50"
+                  }`}
+                >
+                  🔊 סאונד
+                </button>
+              </div>
+              {ackChannel === "audio" && (
+                <p className="mt-2 text-xs text-slate-500">
+                  הטלפון משמיע 2 תדרים ייחודיים — ודא שגם במחשב נבחר מצב סאונד
+                </p>
+              )}
+            </div>
+          )}
 
           {phase === "idle" ? (
             <button
@@ -244,7 +297,11 @@ export default function ReceiverPage() {
             <p className="font-medium text-slate-200">איך זה עובד?</p>
             <ul className="mt-2 list-disc space-y-1 pr-5">
               <li>כוון את המצלמה ל-QR על מסך המחשב</li>
-              <li>ברגע זיהוי — הפנס יהבהב מיד לאישור</li>
+              <li>
+                {ackChannel === "audio"
+                  ? "ברגע זיהוי — הטלפון משמיע 2 תדרים קצרים"
+                  : "ברגע זיהוי — הפנס יהבהב מיד לאישור"}
+              </li>
               <li>אחרי ההבהוב — כוון ל-QR הבא על המחשב</li>
               <li>בסיום — הקבצים יורדו לטלפון</li>
             </ul>
