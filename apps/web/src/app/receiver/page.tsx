@@ -4,7 +4,8 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TransferDecoder } from "@blacking/protocol";
 import type { TransferFile } from "@blacking/protocol";
-import { QrScanner } from "@/lib/qr-scanner";
+import { createQrScanner, type IQrScanner } from "@/lib/qr-scanner-factory";
+import { getStoredQrMode, storeQrMode, qrModeLabel, type QrVisualMode } from "@/lib/qr-mode";
 import { ScanAckSender } from "@/lib/scan-ack-sender";
 import { getStoredAckChannel, storeAckChannel } from "@/lib/ack-channel";
 import type { AckChannel } from "@blacking/protocol";
@@ -23,14 +24,15 @@ export default function ReceiverPage() {
   const [cameraBlocked, setCameraBlocked] = useState<string | null>(null);
   const [networkHint, setNetworkHint] = useState("");
   const [ackChannel, setAckChannel] = useState<AckChannel>("optical");
+  const [qrMode, setQrMode] = useState<QrVisualMode>("standard");
   const videoRef = useRef<HTMLVideoElement>(null);
-  const scannerRef = useRef<QrScanner | null>(null);
+  const scannerRef = useRef<IQrScanner | null>(null);
   const decoderRef = useRef(new TransferDecoder());
   const ackRef = useRef(new ScanAckSender());
   const processingRef = useRef(false);
   const lastScanAtRef = useRef(Date.now());
 
-  const sendAck = useCallback(async (scanner: QrScanner | null) => {
+  const sendAck = useCallback(async (scanner: IQrScanner | null) => {
     ackRef.current.setMode(ackChannel);
     await ackRef.current.send(scanner);
     setTorchSupported(ackRef.current.isTorchSupported());
@@ -99,7 +101,7 @@ export default function ReceiverPage() {
     setStatus("מאתחל מצלמה...");
     lastScanAtRef.current = Date.now();
 
-    const scanner = new QrScanner();
+    const scanner = createQrScanner(qrMode);
     scannerRef.current = scanner;
 
     if (!videoRef.current) {
@@ -123,7 +125,13 @@ export default function ReceiverPage() {
     setCameraBlocked(getCameraBlockedReason());
     setNetworkHint(getLocalNetworkHint(window.location.port ? Number(window.location.port) : 3000));
     setAckChannel(getStoredAckChannel());
+    setQrMode(getStoredQrMode());
   }, []);
+
+  const selectQrMode = (mode: QrVisualMode) => {
+    setQrMode(mode);
+    storeQrMode(mode);
+  };
 
   const selectAckChannel = (channel: AckChannel) => {
     setAckChannel(channel);
@@ -240,6 +248,28 @@ export default function ReceiverPage() {
               <p className="mt-2 text-center text-xs text-emerald-400">מצב סאונד — ודא שהמחשב מאזין למיקרופון</p>
             )}
           </div>
+
+          {phase === "idle" && (
+            <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
+              <p className="font-medium text-slate-200">סוג QR</p>
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                {(["standard", "color", "auto"] as QrVisualMode[]).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => selectQrMode(mode)}
+                    className={`rounded-xl border px-3 py-3 text-sm transition ${
+                      qrMode === mode
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-surface-border hover:border-accent/50"
+                    }`}
+                  >
+                    {qrModeLabel(mode)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {phase === "idle" && (
             <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">

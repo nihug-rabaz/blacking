@@ -1,7 +1,7 @@
 import type { AckChannel } from "@blacking/protocol";
 import { OpticalAckSender } from "@/lib/optical-ack-sender";
 import { ToneAckPlayer } from "@/lib/tone-ack-player";
-import type { QrScanner } from "@/lib/qr-scanner";
+import type { IQrScanner } from "@/lib/qr-scanner-interface";
 import { OpticalSyncTiming } from "@/lib/optical-sync-timing";
 import { AckAudioSignal } from "@blacking/protocol";
 
@@ -30,7 +30,7 @@ export class ScanAckSender {
     return this.optical.isTorchSupported();
   }
 
-  async send(scanner: QrScanner | null): Promise<void> {
+  async send(scanner: IQrScanner | null): Promise<void> {
     if (this.mode === "audio") {
       await this.sendAudio();
       return;

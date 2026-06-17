@@ -7,6 +7,7 @@ import {
   TRANSFER_SPEED_PROFILES,
   getTransferSpeedProfile,
   ChunkBytesConfig,
+  ColorChunkBytesConfig,
   DEFAULT_CHUNK_BYTES,
   AckAudioSignal,
   type TransferSpeed,
@@ -15,6 +16,7 @@ import {
 import { FlashDetector, type FlashMetrics } from "@/lib/flash-detector";
 import { ToneDetector, type ToneMetrics } from "@/lib/tone-detector";
 import { getStoredAckChannel, storeAckChannel } from "@/lib/ack-channel";
+import { getStoredQrMode, storeQrMode, qrModeLabel, type QrVisualMode } from "@/lib/qr-mode";
 import { readFilesFromInput, formatBytes } from "@/lib/file-utils";
 import { generateQrDataUrl, QR_DISPLAY_SIZE } from "@/lib/qr-generator";
 import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
@@ -37,8 +39,10 @@ export default function SenderPage() {
   const [ackReady, setAckReady] = useState(false);
   const [ackError, setAckError] = useState("");
   const [chunkBytes, setChunkBytes] = useState(DEFAULT_CHUNK_BYTES);
+  const [qrMode, setQrMode] = useState<QrVisualMode>("standard");
+  const bytesConfig = qrMode === "color" ? ColorChunkBytesConfig : ChunkBytesConfig;
   const activePreset = TRANSFER_SPEED_PROFILES.find((profile) => profile.chunkBytes === chunkBytes)?.id;
-  const chunkHint = ChunkBytesConfig.hint(chunkBytes);
+  const chunkHint = bytesConfig.hint(chunkBytes);
   const videoRef = useRef<HTMLVideoElement>(null);
   const flashDetectorRef = useRef<FlashDetector | null>(null);
   const toneDetectorRef = useRef<ToneDetector | null>(null);
@@ -61,9 +65,12 @@ export default function SenderPage() {
   const advancingRef = useRef(false);
   const prevQrIndexRef = useRef(-1);
 
-  const applyChunkBytes = useCallback((value: number) => {
-    setChunkBytes(ChunkBytesConfig.clamp(value));
-  }, []);
+  const applyChunkBytes = useCallback(
+    (value: number) => {
+      setChunkBytes(bytesConfig.clamp(value));
+    },
+    [bytesConfig],
+  );
 
   const applyPreset = useCallback((speed: TransferSpeed) => {
     setChunkBytes(getTransferSpeedProfile(speed).chunkBytes);
@@ -134,7 +141,17 @@ export default function SenderPage() {
 
   useEffect(() => {
     setAckChannel(getStoredAckChannel());
+    setQrMode(getStoredQrMode());
   }, []);
+
+  useEffect(() => {
+    setChunkBytes((prev) => bytesConfig.clamp(prev));
+  }, [bytesConfig]);
+
+  const selectQrMode = (mode: QrVisualMode) => {
+    setQrMode(mode);
+    storeQrMode(mode);
+  };
 
   const selectAckChannel = (channel: AckChannel) => {
     setAckChannel(channel);
@@ -151,8 +168,8 @@ export default function SenderPage() {
       return;
     }
 
-    generateQrDataUrl(payload, chunkBytes).then(setQrUrl);
-  }, [phase, payloads, currentIndex, chunkBytes]);
+    generateQrDataUrl(payload, chunkBytes, qrMode).then(setQrUrl);
+  }, [phase, payloads, currentIndex, chunkBytes, qrMode]);
 
   useEffect(() => {
     if (phase !== "transfer") {
@@ -252,6 +269,29 @@ export default function SenderPage() {
       {phase === "input" && (
         <div className="mx-auto max-w-2xl space-y-6">
           <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
+            <h2 className="text-lg font-semibold">סוג QR</h2>
+            <p className="mt-2 text-sm text-slate-400">
+              צבע — יותר נתונים בגריד. שחור-לבן — תאימות מלאה. אוטו — נסה צבע ואז שחור-לבן.
+            </p>
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              {(["standard", "color", "auto"] as QrVisualMode[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => selectQrMode(mode)}
+                  className={`rounded-xl border px-3 py-3 text-sm transition ${
+                    qrMode === mode
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-surface-border hover:border-accent/50"
+                  }`}
+                >
+                  {qrModeLabel(mode)}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
             <h2 className="text-lg font-semibold">גודל נתונים לכל QR</h2>
             <p className="mt-2 text-sm text-slate-400">{chunkHint}</p>
             <div className="mt-4">
@@ -260,22 +300,22 @@ export default function SenderPage() {
                 <div className="mt-2 flex items-center gap-3">
                   <input
                     type="number"
-                    min={ChunkBytesConfig.min}
-                    max={ChunkBytesConfig.max}
+                    min={bytesConfig.min}
+                    max={bytesConfig.max}
                     step={1}
                     value={chunkBytes}
                     onChange={(event) => applyChunkBytes(Number(event.target.value))}
                     className="w-28 rounded-xl border border-surface-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
                   />
                   <span className="text-xs text-slate-500">
-                    {ChunkBytesConfig.min}–{ChunkBytesConfig.max}
+                    {bytesConfig.min}–{bytesConfig.max}
                   </span>
                 </div>
               </label>
               <input
                 type="range"
-                min={ChunkBytesConfig.min}
-                max={ChunkBytesConfig.max}
+                min={bytesConfig.min}
+                max={bytesConfig.max}
                 step={1}
                 value={chunkBytes}
                 onChange={(event) => applyChunkBytes(Number(event.target.value))}
@@ -413,7 +453,7 @@ export default function SenderPage() {
             <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
               <h3 className="font-semibold">הוראות</h3>
               <ol className="mt-3 list-decimal space-y-2 pr-5 text-sm text-slate-300">
-                <li>פתח את דף המקבל בטלפון — אותו מצב ({ackChannel === "audio" ? "סאונד" : "פנס"})</li>
+                <li>פתח את דף המקבל בטלפון — אותו מצב ({ackChannel === "audio" ? "סאונד" : "פנס"}, {qrModeLabel(qrMode)})</li>
                 {ackChannel === "audio" ? (
                   <>
                     <li>הנח את רמקול הטלפון לכיוון מיקרופון המחשב</li>

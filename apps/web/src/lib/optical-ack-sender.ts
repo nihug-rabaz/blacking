@@ -2,7 +2,7 @@ import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
 import { OpticalSyncTiming } from "@/lib/optical-sync-timing";
 import { ScreenAckFlasher } from "@/lib/screen-ack-flasher";
 import { TorchController } from "@/lib/torch-controller";
-import type { QrScanner } from "@/lib/qr-scanner";
+import type { IQrScanner } from "@/lib/qr-scanner-interface";
 
 export class OpticalAckSender {
   private torch = new TorchController();
@@ -28,7 +28,7 @@ export class OpticalAckSender {
     return this.torchWorks;
   }
 
-  async send(scanner: QrScanner | null): Promise<void> {
+  async send(scanner: IQrScanner | null): Promise<void> {
     const preDelay =
       this.ackCount === 0
         ? OpticalSyncTiming.ackPreDelayFirstMs
