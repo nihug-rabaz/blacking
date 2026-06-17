@@ -5,9 +5,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { TransferDecoder } from "@blacking/protocol";
 import type { TransferFile } from "@blacking/protocol";
 import { QrScanner } from "@/lib/qr-scanner";
-import { TorchController } from "@/lib/torch-controller";
-import { ScreenAckFlasher } from "@/lib/screen-ack-flasher";
+import { OpticalAckSender } from "@/lib/optical-ack-sender";
 import { downloadAsZip, downloadFile, formatBytes } from "@/lib/file-utils";
+import { getCameraBlockedReason, getLocalNetworkHint } from "@/lib/camera-access";
 
 type Phase = "idle" | "scanning" | "done";
 
@@ -18,63 +18,77 @@ export default function ReceiverPage() {
   const [assembledFiles, setAssembledFiles] = useState<TransferFile[]>([]);
   const [status, setStatus] = useState("לחץ להתחלת סריקה");
   const [torchSupported, setTorchSupported] = useState<boolean | null>(null);
+  const [cameraBlocked, setCameraBlocked] = useState<string | null>(null);
+  const [networkHint, setNetworkHint] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<QrScanner | null>(null);
   const decoderRef = useRef(new TransferDecoder());
-  const torchRef = useRef(new TorchController());
-  const screenAckRef = useRef(new ScreenAckFlasher());
+  const ackRef = useRef(new OpticalAckSender());
   const processingRef = useRef(false);
-  const lastAckAtRef = useRef(0);
+  const lastScanAtRef = useRef(Date.now());
 
-  const handleScan = useCallback(async (raw: string) => {
-    if (processingRef.current) {
-      return;
-    }
-
-    const decoder = decoderRef.current;
-    const result = decoder.ingest(raw);
-
-    if (!result.accepted) {
-      return;
-    }
-
-    if (result.duplicate) {
-      return;
-    }
-
-    processingRef.current = true;
-    const prog = decoder.getProgress();
-    setProgress(prog);
-    setLastIndex(prog.received - 1);
-    setStatus(`נקלט QR ${prog.received}/${prog.total}`);
-
-    const now = Date.now();
-    if (now - lastAckAtRef.current > 900) {
-      lastAckAtRef.current = now;
-      const torchOk = await torchRef.current.blinkAck();
-      await screenAckRef.current.blinkAck();
-      setTorchSupported(torchOk);
-    }
-
-    if (result.complete) {
-      const files = decoder.assemble();
-      setAssembledFiles(files);
-      setPhase("done");
-      setStatus("ההעברה הושלמה!");
-      scannerRef.current?.stop();
-      await torchRef.current.off();
-    }
-
-    processingRef.current = false;
+  const sendAck = useCallback(async (scanner: QrScanner | null) => {
+    await ackRef.current.send(scanner);
+    setTorchSupported(ackRef.current.isTorchSupported());
   }, []);
 
+  const handleScan = useCallback(
+    async (raw: string) => {
+      if (processingRef.current) {
+        return;
+      }
+
+      const decoder = decoderRef.current;
+      const result = decoder.ingest(raw);
+
+      if (!result.accepted || result.duplicate) {
+        return;
+      }
+
+      processingRef.current = true;
+      lastScanAtRef.current = Date.now();
+
+      try {
+        const prog = decoder.getProgress();
+        setProgress(prog);
+        setLastIndex(prog.received - 1);
+        setStatus(`נקלט QR ${prog.received}/${prog.total} — שולח אות פנס...`);
+        scannerRef.current?.notifyAccepted(prog.received - 1);
+
+        await sendAck(scannerRef.current);
+        setStatus(`נקלט QR ${prog.received}/${prog.total} — המשך לסרוק את ה-QR הבא`);
+
+        if (result.complete) {
+          const files = decoder.assemble();
+          setAssembledFiles(files);
+          setPhase("done");
+          setStatus("ההעברה הושלמה!");
+          scannerRef.current?.stop();
+          await ackRef.current.off();
+        }
+      } finally {
+        processingRef.current = false;
+      }
+    },
+    [sendAck],
+  );
+
   const startScanning = async () => {
+    const blocked = getCameraBlockedReason();
+    if (blocked) {
+      setCameraBlocked(blocked);
+      setStatus(blocked);
+      return;
+    }
+
     decoderRef.current.reset();
+    ackRef.current.reset();
     setProgress({ received: 0, total: 0, filesComplete: 0, fileCount: 0 });
     setLastIndex(-1);
     setAssembledFiles([]);
     setPhase("scanning");
     setStatus("מאתחל מצלמה...");
+    lastScanAtRef.current = Date.now();
 
     const scanner = new QrScanner();
     scannerRef.current = scanner;
@@ -87,29 +101,55 @@ export default function ReceiverPage() {
       await scanner.start(videoRef.current, handleScan);
       const stream = scanner.getStream();
       if (stream) {
-        torchRef.current.bind(stream);
-        const probe = await torchRef.current.setEnabled(true);
-        await torchRef.current.off();
-        setTorchSupported(probe);
+        ackRef.current.bindScannerStream(stream);
       }
       setStatus("סרוק את ה-QR מהמסך");
     } catch {
-      setStatus("שגיאה בגישה למצלמה — אשר הרשאות");
+      setStatus("שגיאה בגישה למצלמה — אשר הרשאות בדפדפן");
       setPhase("idle");
     }
   };
 
+  useEffect(() => {
+    setCameraBlocked(getCameraBlockedReason());
+    setNetworkHint(getLocalNetworkHint(window.location.port ? Number(window.location.port) : 3000));
+  }, []);
+
   const stopScanning = () => {
     scannerRef.current?.stop();
-    torchRef.current.off();
+    ackRef.current.off();
     setPhase("idle");
     setStatus("הסריקה הופסקה");
   };
 
   useEffect(() => {
+    if (phase !== "scanning") {
+      return;
+    }
+
+    const watchdog = window.setInterval(() => {
+      const scanner = scannerRef.current;
+      if (!scanner || processingRef.current) {
+        return;
+      }
+      const idleMs = Date.now() - lastScanAtRef.current;
+      if (idleMs > 5000 && !scanner.isHealthy()) {
+        void scanner.recoverAfterAck().then(() => {
+          const stream = scanner.getStream();
+          if (stream) {
+            ackRef.current.bindScannerStream(stream);
+          }
+        });
+      }
+    }, 2500);
+
+    return () => window.clearInterval(watchdog);
+  }, [phase]);
+
+  useEffect(() => {
     return () => {
       scannerRef.current?.stop();
-      torchRef.current.off();
+      ackRef.current.off();
     };
   }, []);
 
@@ -144,6 +184,19 @@ export default function ReceiverPage() {
             )}
           </div>
 
+          {cameraBlocked && (
+            <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
+              <p className="font-semibold">המצלמה חסומה — חיבור לא מאובטח</p>
+              <p className="mt-2">{cameraBlocked}</p>
+              <p className="mt-3 font-mono text-xs text-amber-100/90">{networkHint}</p>
+              <p className="mt-3 text-xs text-amber-200/80">
+                במחשב הרץ: <span className="font-mono">npm run dev:mobile</span>
+                <br />
+                בטלפון אשר את אזהרת האבטחה (תעודה עצמית) ואז אשר מצלמה
+              </p>
+            </div>
+          )}
+
           <div className="rounded-2xl border border-surface-border bg-surface-raised p-4">
             <p className="text-center font-medium">{status}</p>
             {progress.total > 0 && (
@@ -173,7 +226,8 @@ export default function ReceiverPage() {
           {phase === "idle" ? (
             <button
               onClick={startScanning}
-              className="w-full rounded-2xl bg-accent py-4 text-lg font-bold text-slate-900"
+              disabled={!!cameraBlocked}
+              className="w-full rounded-2xl bg-accent py-4 text-lg font-bold text-slate-900 disabled:opacity-40"
             >
               התחל סריקה
             </button>
@@ -190,8 +244,8 @@ export default function ReceiverPage() {
             <p className="font-medium text-slate-200">איך זה עובד?</p>
             <ul className="mt-2 list-disc space-y-1 pr-5">
               <li>כוון את המצלמה ל-QR על מסך המחשב</li>
-              <li>ברגע זיהוי — הפנס יהבהב לאישור אופטי</li>
-              <li>המחשב יעבור אוטומטית ל-QR הבא</li>
+              <li>ברגע זיהוי — הפנס יהבהב מיד לאישור</li>
+              <li>אחרי ההבהוב — כוון ל-QR הבא על המחשב</li>
               <li>בסיום — הקבצים יורדו לטלפון</li>
             </ul>
           </div>

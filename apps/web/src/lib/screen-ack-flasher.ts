@@ -1,13 +1,15 @@
+import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
+
 export class ScreenAckFlasher {
   private overlay: HTMLDivElement | null = null;
+  private pattern = AckBlinkPattern.standard;
 
-  async blinkAck(): Promise<void> {
+  async blinkAck(pattern = this.pattern): Promise<void> {
     const overlay = this.ensureOverlay();
-    const pattern = [1, 0, 1, 0, 1, 0, 1, 0];
-    for (const opacity of pattern) {
-      overlay.style.opacity = String(opacity);
+    for (const step of pattern.screenSteps) {
+      overlay.style.opacity = String(step.opacity);
       overlay.style.backgroundColor = "#ffffff";
-      await sleep(opacity ? 280 : 180);
+      await sleep(step.durationMs);
     }
     overlay.style.opacity = "0";
   }
@@ -18,7 +20,7 @@ export class ScreenAckFlasher {
     }
     const el = document.createElement("div");
     el.style.cssText =
-      "position:fixed;inset:0;z-index:99999;opacity:0;pointer-events:none;background:#fff;transition:opacity 40ms";
+      "position:fixed;inset:0;z-index:99999;opacity:0;pointer-events:none;background:#fff;transition:opacity 80ms";
     document.body.appendChild(el);
     this.overlay = el;
     return el;

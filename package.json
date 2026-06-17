@@ -7,7 +7,9 @@
   ],
   "scripts": {
     "dev": "npm run dev --workspace=@blacking/web",
+    "dev:mobile": "npm run dev:mobile --workspace=@blacking/web",
     "build": "npm run build --workspace=@blacking/web",
-    "start": "npm run start --workspace=@blacking/web"
+    "start": "npm run start --workspace=@blacking/web",
+    "clean": "npm run clean --workspace=@blacking/web"
   }
 }

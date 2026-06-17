@@ -1,12 +1,16 @@
 import {
-  CHUNK_BYTES,
+  DEFAULT_CHUNK_BYTES,
   PROTOCOL_VERSION,
   type EncodedTransfer,
   type TransferFile,
 } from "./types";
 
+export interface EncodeOptions {
+  chunkBytes?: number;
+}
+
 function randomSessionId(): string {
-  return Math.random().toString(36).slice(2, 10);
+  return Math.random().toString(36).slice(2, 8);
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -14,13 +18,13 @@ function toBase64(bytes: Uint8Array): string {
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary);
+  return btoa(binary).replace(/=+$/, "");
 }
 
-function chunkFile(content: Uint8Array): Uint8Array[] {
+function chunkFile(content: Uint8Array, chunkBytes: number): Uint8Array[] {
   const chunks: Uint8Array[] = [];
-  for (let offset = 0; offset < content.length; offset += CHUNK_BYTES) {
-    chunks.push(content.slice(offset, offset + CHUNK_BYTES));
+  for (let offset = 0; offset < content.length; offset += chunkBytes) {
+    chunks.push(content.slice(offset, offset + chunkBytes));
   }
   if (chunks.length === 0) {
     chunks.push(new Uint8Array(0));
@@ -29,12 +33,13 @@ function chunkFile(content: Uint8Array): Uint8Array[] {
 }
 
 export class TransferEncoder {
-  encode(files: TransferFile[]): EncodedTransfer {
+  encode(files: TransferFile[], options?: EncodeOptions): EncodedTransfer {
+    const chunkBytes = options?.chunkBytes ?? DEFAULT_CHUNK_BYTES;
     const sessionId = randomSessionId();
     const fileChunks = files.map((file) => ({
       path: file.path,
       size: file.content.length,
-      chunks: chunkFile(file.content),
+      chunks: chunkFile(file.content, chunkBytes),
     }));
 
     const manifest = {
@@ -42,6 +47,7 @@ export class TransferEncoder {
       t: "M" as const,
       id: sessionId,
       i: 0,
+      cb: chunkBytes,
       files: fileChunks.map((entry) => ({
         p: entry.path,
         s: entry.size,
@@ -81,8 +87,8 @@ export class TransferEncoder {
     };
   }
 
-  encodeText(text: string, filename = "content.txt"): EncodedTransfer {
+  encodeText(text: string, filename = "content.txt", options?: EncodeOptions): EncodedTransfer {
     const encoder = new TextEncoder();
-    return this.encode([{ path: filename, content: encoder.encode(text) }]);
+    return this.encode([{ path: filename, content: encoder.encode(text) }], options);
   }
 }

@@ -1,5 +1,5 @@
 export const PROTOCOL_VERSION = 1;
-export const CHUNK_BYTES = 480;
+export const DEFAULT_CHUNK_BYTES = 180;
 
 export type QrType = "M" | "D";
 
@@ -14,6 +14,7 @@ export interface SessionManifest {
   t: "M";
   id: string;
   i: number;
+  cb?: number;
   files: FileManifestEntry[];
   total: number;
 }

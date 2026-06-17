@@ -2,10 +2,18 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { TransferEncoder } from "@blacking/protocol";
+import {
+  TransferEncoder,
+  TRANSFER_SPEED_PROFILES,
+  getTransferSpeedProfile,
+  ChunkBytesConfig,
+  DEFAULT_CHUNK_BYTES,
+  type TransferSpeed,
+} from "@blacking/protocol";
 import { FlashDetector, type FlashMetrics } from "@/lib/flash-detector";
 import { readFilesFromInput, formatBytes } from "@/lib/file-utils";
-import { generateQrDataUrl } from "@/lib/qr-generator";
+import { generateQrDataUrl, QR_DISPLAY_SIZE } from "@/lib/qr-generator";
+import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
 
 type Phase = "input" | "transfer" | "done";
 
@@ -19,29 +27,56 @@ export default function SenderPage() {
   const [flashReady, setFlashReady] = useState(false);
   const [cameraError, setCameraError] = useState("");
   const [flashMetrics, setFlashMetrics] = useState<FlashMetrics | null>(null);
-  const [sensitivity, setSensitivity] = useState(1.45);
+  const [minJump, setMinJump] = useState(18);
+  const [chunkBytes, setChunkBytes] = useState(DEFAULT_CHUNK_BYTES);
+  const activePreset = TRANSFER_SPEED_PROFILES.find((profile) => profile.chunkBytes === chunkBytes)?.id;
+  const chunkHint = ChunkBytesConfig.hint(chunkBytes);
   const videoRef = useRef<HTMLVideoElement>(null);
   const detectorRef = useRef<FlashDetector | null>(null);
+  const resetSession = useCallback(() => {
+    detectorRef.current?.stop();
+    detectorRef.current = null;
+    setFlashMetrics(null);
+    setFlashReady(false);
+    setCameraError("");
+    setQrUrl("");
+    setCurrentIndex(0);
+    setPayloads([]);
+  }, []);
+
   const advancingRef = useRef(false);
+  const prevQrIndexRef = useRef(-1);
+
+  const applyChunkBytes = useCallback((value: number) => {
+    setChunkBytes(ChunkBytesConfig.clamp(value));
+  }, []);
+
+  const applyPreset = useCallback((speed: TransferSpeed) => {
+    setChunkBytes(getTransferSpeedProfile(speed).chunkBytes);
+  }, []);
 
   const startTransfer = useCallback(async (files: { path: string; content: Uint8Array }[]) => {
+    setFlashMetrics(null);
+    setFlashReady(false);
     const encoder = new TransferEncoder();
-    const encoded = encoder.encode(files);
+    const encoded = encoder.encode(files, { chunkBytes });
     setPayloads(encoded.payloads);
     setCurrentIndex(0);
-    setFileInfo(`${encoded.fileCount} קבצים · ${encoded.totalQrs} QR codes`);
+    setFileInfo(`${encoded.fileCount} קבצים · ${encoded.totalQrs} QR · ${chunkBytes}B / QR`);
     setPhase("transfer");
-  }, []);
+  }, [chunkBytes]);
 
   const handleTextStart = () => {
     if (!text.trim()) {
       return;
     }
+    setFlashMetrics(null);
+    setFlashReady(false);
     const encoder = new TransferEncoder();
-    const encoded = encoder.encodeText(text);
+    const encoded = encoder.encodeText(text, "content.txt", { chunkBytes });
     setPayloads(encoded.payloads);
     setCurrentIndex(0);
-    setFileInfo(`טקסט · ${encoded.totalQrs} QR codes`);
+    setFileInfo(`טקסט · ${encoded.totalQrs} QR · ${chunkBytes}B / QR`);
     setPhase("transfer");
   };
 
@@ -73,7 +108,7 @@ export default function SenderPage() {
     });
     setTimeout(() => {
       advancingRef.current = false;
-    }, 600);
+    }, 200);
   }, [payloads.length]);
 
   useEffect(() => {
@@ -86,8 +121,25 @@ export default function SenderPage() {
       return;
     }
 
-    generateQrDataUrl(payload).then(setQrUrl);
-  }, [phase, payloads, currentIndex]);
+    generateQrDataUrl(payload, chunkBytes).then(setQrUrl);
+  }, [phase, payloads, currentIndex, chunkBytes]);
+
+  useEffect(() => {
+    if (phase !== "transfer") {
+      prevQrIndexRef.current = -1;
+      return;
+    }
+    const detector = detectorRef.current;
+    if (!detector) {
+      return;
+    }
+    if (prevQrIndexRef.current !== currentIndex) {
+      if (prevQrIndexRef.current >= 0) {
+        detector.onQrChanged();
+      }
+      prevQrIndexRef.current = currentIndex;
+    }
+  }, [currentIndex, phase]);
 
   useEffect(() => {
     if (phase !== "transfer") {
@@ -99,7 +151,7 @@ export default function SenderPage() {
       try {
         detector = new FlashDetector({
           onFlash: advanceQr,
-          thresholdMultiplier: sensitivity,
+          minJump,
           onMetrics: setFlashMetrics,
         });
         detectorRef.current = detector;
@@ -126,8 +178,8 @@ export default function SenderPage() {
   }, [phase, advanceQr]);
 
   useEffect(() => {
-    detectorRef.current?.setThreshold(sensitivity);
-  }, [sensitivity]);
+    detectorRef.current?.setMinJump(minJump);
+  }, [minJump]);
 
   const progress = payloads.length ? Math.round((currentIndex / payloads.length) * 100) : 0;
 
@@ -143,6 +195,57 @@ export default function SenderPage() {
 
       {phase === "input" && (
         <div className="mx-auto max-w-2xl space-y-6">
+          <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
+            <h2 className="text-lg font-semibold">גודל נתונים לכל QR</h2>
+            <p className="mt-2 text-sm text-slate-400">{chunkHint}</p>
+            <div className="mt-4">
+              <label className="block text-sm text-slate-300">
+                בתים לכל QR (payload)
+                <div className="mt-2 flex items-center gap-3">
+                  <input
+                    type="number"
+                    min={ChunkBytesConfig.min}
+                    max={ChunkBytesConfig.max}
+                    step={1}
+                    value={chunkBytes}
+                    onChange={(event) => applyChunkBytes(Number(event.target.value))}
+                    className="w-28 rounded-xl border border-surface-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent"
+                  />
+                  <span className="text-xs text-slate-500">
+                    {ChunkBytesConfig.min}–{ChunkBytesConfig.max}
+                  </span>
+                </div>
+              </label>
+              <input
+                type="range"
+                min={ChunkBytesConfig.min}
+                max={ChunkBytesConfig.max}
+                step={1}
+                value={chunkBytes}
+                onChange={(event) => applyChunkBytes(Number(event.target.value))}
+                className="mt-3 w-full accent-accent"
+              />
+            </div>
+            <p className="mt-3 text-xs text-slate-500">קיצורי דרך</p>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {TRANSFER_SPEED_PROFILES.map((profile) => (
+                <button
+                  key={profile.id}
+                  type="button"
+                  onClick={() => applyPreset(profile.id)}
+                  className={`rounded-xl border px-4 py-3 text-right text-sm transition ${
+                    activePreset === profile.id
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-surface-border hover:border-accent/50"
+                  }`}
+                >
+                  <span className="block font-semibold">{profile.label}</span>
+                  <span className="mt-1 block text-xs text-slate-400">{profile.chunkBytes}B / QR</span>
+                </button>
+              ))}
+            </div>
+          </section>
+
           <section className="rounded-2xl border border-surface-border bg-surface-raised p-6">
             <h2 className="text-lg font-semibold">העברת טקסט</h2>
             <textarea
@@ -185,14 +288,24 @@ export default function SenderPage() {
       )}
 
       {phase === "transfer" && currentIndex < payloads.length && (
-        <div className="mx-auto flex max-w-5xl flex-col items-center gap-6 lg:flex-row lg:items-start lg:justify-center">
-          <div className="flex flex-col items-center">
-            <div className="rounded-2xl bg-white p-4 shadow-2xl shadow-accent/10">
-              {qrUrl ? (
-                <img src={qrUrl} alt="QR Code" width={400} height={400} className="block" />
+        <div className="mx-auto flex max-w-7xl flex-col items-center gap-8 xl:flex-row xl:items-start xl:justify-center">
+          <div className="flex w-full max-w-[840px] flex-col items-center">
+            <div className="w-full rounded-2xl bg-white p-3 shadow-2xl shadow-accent/10 sm:p-5">
+              {flashMetrics?.phase !== "calibrating" && qrUrl ? (
+                <img
+                  src={qrUrl}
+                  alt="QR Code"
+                  width={QR_DISPLAY_SIZE}
+                  height={QR_DISPLAY_SIZE}
+                  className="block h-auto w-full max-w-full"
+                />
               ) : (
-                <div className="flex h-[400px] w-[400px] items-center justify-center text-slate-500">
-                  טוען...
+                <div
+                  className="flex w-full flex-col items-center justify-center gap-2 text-slate-500"
+                  style={{ aspectRatio: "1 / 1", minHeight: QR_DISPLAY_SIZE }}
+                >
+                  <span className="text-4xl">📷</span>
+                  <span className="text-base">מכייל מצלמה...</span>
                 </div>
               )}
             </div>
@@ -226,34 +339,79 @@ export default function SenderPage() {
               />
               {flashMetrics && (
                 <div className="mt-3 space-y-2">
-                  <div className="flex justify-between text-xs text-slate-400">
-                    <span>בהירות שיא</span>
-                    <span>{flashMetrics.ratio.toFixed(2)}x מהרקע</span>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">
+                      {flashMetrics.phase === "calibrating"
+                        ? `קולט בהירות רקע... ${Math.round(flashMetrics.calibrationProgress * 100)}%`
+                        : flashMetrics.phase === "warmingUp"
+                          ? "מתייצב עם QR על המסך..."
+                        : flashMetrics.graceRemainingMs > 0
+                        ? flashMetrics.graceRemainingMs <= 200
+                          ? "מוכן לפנס"
+                          : "מוכן בעוד רגע..."
+                          : `ממתין ל-${flashMetrics.requiredSpikes} קפיצות קטנות`}
+                    </span>
+                    <span
+                      className={
+                        flashMetrics.ready && flashMetrics.spikeCount > 0
+                          ? "text-emerald-400"
+                          : "text-slate-500"
+                      }
+                    >
+                      {flashMetrics.ready
+                        ? `${flashMetrics.spikeCount}/${flashMetrics.requiredSpikes} קפיצות`
+                        : "—"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between text-xs text-slate-500">
+                    <span>רקע: {flashMetrics.baseline.toFixed(0)}</span>
+                    <span>נוכחי: {flashMetrics.peak.toFixed(0)}</span>
+                    <span>קפיצה: {flashMetrics.jump.toFixed(0)}</span>
                   </div>
                   <div className="h-2 overflow-hidden rounded-full bg-surface-border">
                     <div
-                      className={`h-full transition-all ${flashMetrics.ratio >= sensitivity ? "bg-emerald-400" : "bg-accent"}`}
-                      style={{ width: `${Math.min(100, (flashMetrics.ratio / 3) * 100)}%` }}
+                      className={`h-full transition-all ${
+                        flashMetrics.phase === "calibrating" || flashMetrics.phase === "warmingUp"
+                          ? "bg-amber-400"
+                          : flashMetrics.spikeCount >= flashMetrics.requiredSpikes
+                            ? "bg-emerald-400"
+                            : flashMetrics.jump >= minJump
+                              ? "bg-yellow-400"
+                              : "bg-accent"
+                      }`}
+                      style={{
+                        width: `${
+                          flashMetrics.phase === "calibrating" || flashMetrics.phase === "warmingUp"
+                            ? flashMetrics.calibrationProgress * 100
+                            : (flashMetrics.spikeCount / flashMetrics.requiredSpikes) * 100
+                        }%`,
+                      }}
                     />
                   </div>
                   <p className="text-xs text-slate-500">
-                    {flashMetrics.armed
-                      ? flashMetrics.spikes > 0
-                        ? `זוהתה הבהוב (${flashMetrics.spikes})...`
-                        : "ממתין להבהוב — ודא שגב הטלפון פונה למצלמה"
-                      : "אושר — עובר ל-QR הבא"}
+                    {flashMetrics.phase === "calibrating"
+                      ? "מכייל מצלמה לפני הצגת QR — אל תכוון פנס"
+                      : flashMetrics.phase === "warmingUp"
+                        ? "QR מוצג — המתן לסיום ייצוב לפני סריקה"
+                      : flashMetrics.graceRemainingMs > 0
+                        ? flashMetrics.graceRemainingMs <= 200
+                          ? "מוכן לפנס — הטלפון יהבהב בקרוב"
+                          : "מוכן בעוד רגע..."
+                        : flashMetrics.armed
+                          ? `מוכן — ${AckBlinkPattern.requiredSpikes} קפיצות אור = סריקה אושרה`
+                          : "סריקה זוהתה — עובר ל-QR הבא"}
                   </p>
                 </div>
               )}
               <label className="mt-3 block text-xs text-slate-400">
-                רגישות זיהוי: {sensitivity.toFixed(2)}
+                סף קפיצה מינימלי: {minJump}
                 <input
                   type="range"
-                  min="1.15"
-                  max="2.5"
-                  step="0.05"
-                  value={sensitivity}
-                  onChange={(e) => setSensitivity(Number(e.target.value))}
+                  min="6"
+                  max="25"
+                  step="1"
+                  value={minJump}
+                  onChange={(e) => setMinJump(Number(e.target.value))}
                   className="mt-1 w-full accent-accent"
                 />
               </label>
@@ -281,10 +439,8 @@ export default function SenderPage() {
           <p className="mt-2 text-slate-400">כל ה-QR codes נשלחו. בדוק את הטלפון להורדת הקבצים.</p>
           <button
             onClick={() => {
+              resetSession();
               setPhase("input");
-              setPayloads([]);
-              setCurrentIndex(0);
-              setQrUrl("");
             }}
             className="mt-6 rounded-xl bg-accent px-8 py-3 font-semibold text-slate-900"
           >

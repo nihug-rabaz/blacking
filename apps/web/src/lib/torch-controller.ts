@@ -1,3 +1,5 @@
+import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
+
 type TorchCapableTrack = MediaStreamTrack & {
   applyConstraints: (constraints: MediaTrackConstraints) => Promise<void>;
 };
@@ -5,6 +7,7 @@ type TorchCapableTrack = MediaStreamTrack & {
 export class TorchController {
   private track: TorchCapableTrack | null = null;
   private supported = false;
+  private pattern = AckBlinkPattern.standard;
 
   bind(stream: MediaStream): void {
     this.track = stream.getVideoTracks()[0] as TorchCapableTrack;
@@ -40,21 +43,16 @@ export class TorchController {
     }
   }
 
-  async blinkAck(): Promise<boolean> {
-    const pattern = [true, false, true, false, true, false, true, false] as const;
+  async blinkAck(pattern = this.pattern): Promise<boolean> {
     let anySuccess = false;
-    for (const state of pattern) {
-      const ok = await this.setEnabled(state);
-      if (ok && state) {
+    for (const step of pattern.torchSteps) {
+      const ok = await this.setEnabled(step.enabled);
+      if (ok && step.enabled) {
         anySuccess = true;
       }
-      await sleep(state ? 280 : 180);
+      await sleep(step.durationMs);
     }
     return anySuccess;
-  }
-
-  async testBlink(): Promise<boolean> {
-    return this.blinkAck();
   }
 
   async off(): Promise<void> {

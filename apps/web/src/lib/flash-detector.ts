@@ -1,17 +1,38 @@
+import { AckBlinkPattern } from "@/lib/ack-blink-pattern";
+import { OpticalSyncTiming } from "@/lib/optical-sync-timing";
+
+export type FlashDetectorPhase = "calibrating" | "warmingUp" | "watching";
+
 export type FlashDetectorOptions = {
   onFlash: () => void;
-  thresholdMultiplier?: number;
+  onReady?: () => void;
+  minJump?: number;
+  requiredSpikes?: number;
+  spikeWindowMs?: number;
   cooldownMs?: number;
+  calibrationFrames?: number;
+  warmupMs?: number;
+  watchingGraceMs?: number;
   onMetrics?: (metrics: FlashMetrics) => void;
 };
 
 export type FlashMetrics = {
-  luminance: number;
+  phase: FlashDetectorPhase;
+  current: number;
   peak: number;
   baseline: number;
-  ratio: number;
+  jump: number;
+  spikeCount: number;
+  requiredSpikes: number;
+  calibrationProgress: number;
+  ready: boolean;
   armed: boolean;
-  spikes: number;
+  graceRemainingMs: number;
+};
+
+type FrameBrightness = {
+  average: number;
+  peak: number;
 };
 
 export class FlashDetector {
@@ -21,24 +42,35 @@ export class FlashDetector {
   private stream: MediaStream | null = null;
   private rafId = 0;
   private running = false;
-  private baseline = 0;
-  private calibrating = true;
-  private calibrationFrames = 0;
-  private lastFlashAt = 0;
+  private phase: FlashDetectorPhase = "calibrating";
   private armed = true;
-  private spikeCount = 0;
-  private spikeWindowStart = 0;
-  private prevPeak = 0;
+  private lastFlashAt = 0;
+  private warmupStartedAt = 0;
+  private watchingGraceUntil = 0;
+  private initialWatchComplete = false;
+  private lastFrame: FrameBrightness = { average: 0, peak: 0 };
+  private readonly sampler = new BrightnessSampler();
+  private readonly spikeCounter = new DoubleSpikeCounter();
   private readonly onFlash: () => void;
+  private readonly onReady?: () => void;
   private readonly onMetrics?: (metrics: FlashMetrics) => void;
-  private thresholdMultiplier: number;
   private readonly cooldownMs: number;
+  private readonly warmupMs: number;
+  private readonly watchingGraceMs: number;
 
   constructor(options: FlashDetectorOptions) {
     this.onFlash = options.onFlash;
+    this.onReady = options.onReady;
     this.onMetrics = options.onMetrics;
-    this.thresholdMultiplier = options.thresholdMultiplier ?? 1.45;
-    this.cooldownMs = options.cooldownMs ?? 1000;
+    this.cooldownMs = options.cooldownMs ?? 350;
+    this.warmupMs = options.warmupMs ?? 1200;
+    this.watchingGraceMs = options.watchingGraceMs ?? 700;
+    this.sampler.setRequiredFrames(options.calibrationFrames ?? 45);
+    this.spikeCounter.configure(
+      options.minJump ?? 18,
+      options.requiredSpikes ?? AckBlinkPattern.requiredSpikes,
+      options.spikeWindowMs ?? AckBlinkPattern.standard.totalDurationMs + 2500,
+    );
     this.video = document.createElement("video");
     this.video.playsInline = true;
     this.video.muted = true;
@@ -54,8 +86,8 @@ export class FlashDetector {
     return this.video;
   }
 
-  setThreshold(multiplier: number): void {
-    this.thresholdMultiplier = multiplier;
+  setMinJump(minJump: number): void {
+    this.spikeCounter.setMinJump(minJump);
   }
 
   async start(): Promise<void> {
@@ -74,15 +106,21 @@ export class FlashDetector {
     this.video.srcObject = this.stream;
     await this.video.play();
     this.running = true;
-    this.resetCalibration();
+    this.beginCalibration();
     this.loop();
   }
 
   rearm(): void {
     this.armed = true;
-    this.spikeCount = 0;
-    this.spikeWindowStart = 0;
-    this.resetCalibration();
+    if (this.initialWatchComplete) {
+      this.beginQuickRearm();
+      return;
+    }
+    this.beginCalibration();
+  }
+
+  onQrChanged(): void {
+    this.rearm();
   }
 
   async stop(): Promise<void> {
@@ -93,11 +131,38 @@ export class FlashDetector {
     this.video.srcObject = null;
   }
 
-  private resetCalibration(): void {
-    this.baseline = 0;
-    this.calibrating = true;
-    this.calibrationFrames = 0;
-    this.prevPeak = 0;
+  private beginCalibration(): void {
+    this.phase = "calibrating";
+    this.warmupStartedAt = 0;
+    this.watchingGraceUntil = 0;
+    this.sampler.reset();
+    this.sampler.setRequiredFrames(45);
+    this.spikeCounter.reset();
+    this.spikeCounter.unlockBaseline();
+  }
+
+  private beginWarmup(): void {
+    this.phase = "warmingUp";
+    this.warmupStartedAt = Date.now();
+    this.spikeCounter.reset();
+    this.sampler.reset();
+    this.sampler.setRequiredFrames(18);
+    this.onReady?.();
+  }
+
+  private beginWatching(): void {
+    this.phase = "watching";
+    this.watchingGraceUntil = Date.now() + this.watchingGraceMs;
+    this.spikeCounter.reset();
+    this.initialWatchComplete = true;
+  }
+
+  private beginQuickRearm(): void {
+    this.phase = "watching";
+    this.lastFlashAt = 0;
+    this.watchingGraceUntil = Date.now() + OpticalSyncTiming.quickRearmGraceMs;
+    this.spikeCounter.reset();
+    this.flushMetrics();
   }
 
   private loop = (): void => {
@@ -118,72 +183,208 @@ export class FlashDetector {
     this.canvas.height = videoHeight;
     this.ctx.drawImage(this.video, 0, 0);
     const { data, width, height } = this.ctx.getImageData(0, 0, videoWidth, videoHeight);
-    const { average, peak, brightRatio } = measureFrame(data, width, height);
-    const luminance = average;
+    const frame = measureFrame(data, width, height);
+    this.lastFrame = frame;
 
-    if (this.calibrating) {
-      this.calibrationFrames++;
-      if (this.baseline === 0) {
-        this.baseline = luminance;
-      } else {
-        this.baseline = this.baseline * 0.85 + luminance * 0.15;
+    if (this.phase === "calibrating") {
+      this.sampler.add(frame);
+      if (this.sampler.isComplete()) {
+        this.spikeCounter.lockBaseline(this.sampler.getBaseline());
+        this.beginWarmup();
       }
-      if (this.calibrationFrames >= 20) {
-        this.calibrating = false;
-      }
-      this.emitMetrics(luminance, peak);
+      this.emitMetrics(frame, 0);
       return;
     }
 
-    if (this.baseline > 0 && luminance < this.baseline * 1.12) {
-      this.baseline = this.baseline * 0.97 + luminance * 0.03;
+    if (this.phase === "warmingUp") {
+      this.sampler.add(frame);
+      const elapsed = Date.now() - this.warmupStartedAt;
+      if (elapsed >= this.warmupMs && this.sampler.isComplete()) {
+        this.spikeCounter.lockBaseline(this.sampler.getBaseline());
+        this.beginWatching();
+      }
+      this.emitMetrics(frame, 0);
+      return;
     }
 
-    const peakRatio = peak / Math.max(this.baseline, 1);
-    const avgRatio = luminance / Math.max(this.baseline, 1);
-    const peakDelta = peak - this.prevPeak;
-    this.prevPeak = peak * 0.3 + this.prevPeak * 0.7;
-
-    const ratio = Math.max(peakRatio, avgRatio);
-    const isSpike =
-      this.armed &&
-      (peakRatio >= this.thresholdMultiplier ||
-        (peakRatio >= this.thresholdMultiplier * 0.85 && brightRatio >= 0.008) ||
-        (peakDelta >= 35 && peakRatio >= 1.25));
-
-    if (isSpike) {
-      const now = Date.now();
-      if (this.spikeWindowStart === 0 || now - this.spikeWindowStart > 2500) {
-        this.spikeWindowStart = now;
-        this.spikeCount = 0;
-      }
-      this.spikeCount++;
-
-      if (this.spikeCount >= 2 && now - this.lastFlashAt > this.cooldownMs) {
-        this.lastFlashAt = now;
-        this.armed = false;
-        this.spikeCount = 0;
-        this.spikeWindowStart = 0;
-        this.onFlash();
-        setTimeout(() => this.resetCalibration(), 300);
-      }
+    const inGrace = Date.now() < this.watchingGraceUntil;
+    if (inGrace) {
+      this.emitMetrics(frame, 0, true);
+      return;
     }
 
-    this.emitMetrics(luminance, peak);
+    const result = this.spikeCounter.process(frame);
+    this.emitMetrics(frame, result.jump, false);
+
+    if (!this.armed || inGrace || !result.complete) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - this.lastFlashAt < this.cooldownMs) {
+      return;
+    }
+
+    this.lastFlashAt = now;
+    this.armed = false;
+    this.spikeCounter.reset();
+    this.flushMetrics();
+    this.onFlash();
   }
 
-  private emitMetrics(luminance: number, peak: number): void {
+  private flushMetrics(): void {
+    const inGrace = Date.now() < this.watchingGraceUntil;
+    this.emitMetrics(this.lastFrame, 0, inGrace);
+  }
+
+  private emitMetrics(frame: FrameBrightness, jump: number, inGrace = false): void {
     if (!this.onMetrics) {
       return;
     }
+
+    const baseline = this.spikeCounter.getBaseline();
+    const ready = this.phase === "watching" && !inGrace;
+    const graceRemainingMs = Math.max(0, this.watchingGraceUntil - Date.now());
     this.onMetrics({
-      luminance,
-      peak,
-      baseline: this.baseline,
-      ratio: peak / Math.max(this.baseline, 1),
-      armed: this.armed,
-      spikes: this.spikeCount,
+      phase: this.phase,
+      current: frame.average,
+      peak: frame.peak,
+      baseline,
+      jump,
+      spikeCount:
+        this.phase === "watching" && this.armed
+          ? this.spikeCounter.getSpikeCount()
+          : 0,
+      requiredSpikes: this.spikeCounter.getRequiredSpikes(),
+      calibrationProgress: this.sampler.getProgress(),
+      ready,
+      armed: this.armed && ready,
+      graceRemainingMs: this.phase === "watching" ? graceRemainingMs : 0,
     });
+  }
+}
+
+class BrightnessSampler {
+  private samples: FrameBrightness[] = [];
+  private requiredFrames = 60;
+
+  setRequiredFrames(frames: number): void {
+    this.requiredFrames = frames;
+  }
+
+  add(frame: FrameBrightness): void {
+    if (this.samples.length < this.requiredFrames) {
+      this.samples.push(frame);
+    }
+  }
+
+  isComplete(): boolean {
+    return this.samples.length >= this.requiredFrames;
+  }
+
+  getProgress(): number {
+    return Math.min(1, this.samples.length / this.requiredFrames);
+  }
+
+  getBaseline(): FrameBrightness {
+    const averages = this.samples.map((sample) => sample.average);
+    const peaks = this.samples.map((sample) => sample.peak);
+    return {
+      average: median(averages),
+      peak: median(peaks),
+    };
+  }
+
+  reset(): void {
+    this.samples = [];
+  }
+}
+
+class DoubleSpikeCounter {
+  private baseline: FrameBrightness = { average: 0, peak: 0 };
+  private locked = false;
+  private minJump = 18;
+  private requiredSpikes = AckBlinkPattern.requiredSpikes;
+  private spikeWindowMs = 2500;
+  private spikeCount = 0;
+  private windowStart = 0;
+  private aboveThreshold = false;
+  private lastSpikeAt = 0;
+
+  configure(minJump: number, requiredSpikes: number, spikeWindowMs: number): void {
+    this.minJump = minJump;
+    this.requiredSpikes = requiredSpikes;
+    this.spikeWindowMs = spikeWindowMs;
+  }
+
+  setMinJump(minJump: number): void {
+    this.minJump = minJump;
+  }
+
+  getRequiredSpikes(): number {
+    return this.requiredSpikes;
+  }
+
+  getSpikeCount(): number {
+    return this.spikeCount;
+  }
+
+  lockBaseline(baseline: FrameBrightness): void {
+    this.baseline = baseline;
+    this.locked = true;
+  }
+
+  getBaseline(): number {
+    return this.baseline.average;
+  }
+
+  unlockBaseline(): void {
+    this.locked = false;
+  }
+
+  reset(): void {
+    this.spikeCount = 0;
+    this.windowStart = 0;
+    this.aboveThreshold = false;
+    this.lastSpikeAt = 0;
+  }
+
+  process(frame: FrameBrightness): { jump: number; complete: boolean } {
+    if (!this.locked) {
+      return { jump: 0, complete: false };
+    }
+
+    const jump = Math.max(
+      frame.average - this.baseline.average,
+      frame.peak - this.baseline.peak,
+    );
+    const now = Date.now();
+
+    if (this.windowStart > 0 && now - this.windowStart > this.spikeWindowMs) {
+      const keepPartial = this.spikeCount > 0 && this.spikeCount < this.requiredSpikes;
+      if (!keepPartial) {
+        this.spikeCount = 0;
+        this.windowStart = 0;
+      }
+    }
+
+    if (jump >= this.minJump) {
+      if (!this.aboveThreshold && now - this.lastSpikeAt > 280) {
+        this.aboveThreshold = true;
+        this.lastSpikeAt = now;
+        if (this.windowStart === 0) {
+          this.windowStart = now;
+        }
+        this.spikeCount++;
+      }
+    } else if (jump < this.minJump * 0.8) {
+      this.aboveThreshold = false;
+    }
+
+    return {
+      jump,
+      complete: this.spikeCount >= this.requiredSpikes,
+    };
   }
 }
 
@@ -191,12 +392,10 @@ function measureFrame(
   data: Uint8ClampedArray,
   width: number,
   height: number,
-): { average: number; peak: number; brightRatio: number } {
+): FrameBrightness {
   let sum = 0;
   let count = 0;
   let peak = 0;
-  let brightCount = 0;
-  const brightThreshold = 200;
 
   for (let y = 0; y < height; y += 3) {
     for (let x = 0; x < width; x += 3) {
@@ -207,15 +406,20 @@ function measureFrame(
       if (lum > peak) {
         peak = lum;
       }
-      if (lum >= brightThreshold) {
-        brightCount++;
-      }
     }
   }
 
   return {
     average: count ? sum / count : 0,
     peak,
-    brightRatio: count ? brightCount / count : 0,
   };
+}
+
+function median(values: number[]): number {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
